@@ -1,0 +1,722 @@
+--- ndarray.sau — the array type.
+---
+--- An `NDArray` is a flat `table<float>` plus a shape. It is always
+--- contiguous and row-major: there are no views, so `reshape` and
+--- `transpose` hand back fresh arrays rather than aliasing the original.
+--- That costs a copy and buys the guarantee that no two arrays ever share
+--- storage, so a mutation through one name can never surprise another.
+---
+--- The index arithmetic lives in [Shape], the loops in [Kernel] and the
+--- rendering in [Format]. What is left here is the typed surface: the
+--- operators, and the methods that name an operation the operators cannot.
+---
+--- ## Operators
+---
+--- Arithmetic is the language's own, and the right-hand side may be
+--- another array, a lone `float`, or a `table<float>`:
+---
+---     local a: NDArray = {1.0, 2.0, 3.0}
+---     local b: NDArray = {10.0, 20.0, 30.0}
+---
+---     a + b          -- elementwise, broadcasting
+---     a * 2.0        -- every element doubled
+---     a ^ 2.0        -- every element squared
+---     a + {1.0, 1.0, 1.0}
+---     -a             -- negated
+---     #a             -- element count
+---     a[2]           -- flat element, 1-based
+---     a[2] = 9.0     -- written in place
+---     a == b         -- same shape, same contents
+---
+--- Two rules worth knowing. Arithmetic dispatches on its **left** operand,
+--- so `2.0 * a` cannot work — put the array first. And `*` is elementwise,
+--- not a matrix product; that one is `matmul`, which has no operator to
+--- borrow.
+---
+--- Indices are **1-based** throughout, like every other index in Saule.
+--- Elements are `float`, so an `integer` headed for an array needs `as
+--- float` (or the `f` suffix) at the call site — passing `2` where `2.0`
+--- belongs is reported rather than promoted.
+
+import * from shape
+import * from kernel
+import * from format
+import Scalar from scalar
+
+export class NDArray implements OpAdd<any, NDArray>, OpSub<any, NDArray>,
+  OpMul<any, NDArray>, OpDiv<any, NDArray>, OpMod<any, NDArray>,
+  OpPow<any, NDArray>, OpNeg<NDArray>, OpLen, OpEq<NDArray>, OpToString,
+  OpIndex<integer, float>, OpNewIndex<integer, float>, Assignable<table<float>>
+
+  local data: table<float>
+  local dims: table<integer>
+
+  --- Wrap an existing flat buffer. The buffer is taken, not copied, so
+  --- don't hand over a table you still intend to write to.
+  fn init(data: table<float>, dims: table<integer>)
+    if #data != Shape.sizeOf(dims) then
+      throw "numsol: " .. #data .. " elements do not fill shape " .. Shape.text(dims)
+    end
+
+    self.data = data
+    self.dims = dims
+  end
+
+  --- `local a: NDArray = {1.0, 2.0, 3.0}` — the `Assignable` contract, so
+  --- a plain float table fills an `NDArray` slot as a vector.
+  static fn of(values: table<float>) -> NDArray
+    return NDArray(Table.copy(values), {#values})
+  end
+
+  --- A zero-filled array. This is the one constructor on the type itself,
+  --- because the methods below allocate through it; the rest of the
+  --- numpy-style family — `ones`, `eye`, `arange`, `randn` and so on —
+  --- lives on [Num].
+  static fn zeros(dims: table<integer>) -> NDArray
+    return NDArray(Kernel.filled(Shape.sizeOf(dims), 0.0), Table.copy(dims))
+  end
+
+  --- Read an operand as an array. This is what lets `a + 2.0` and
+  --- `a + {1.0, 2.0}` mean what they look like: an `NDArray` passes
+  --- through, a `float` becomes a one-element array that broadcasts
+  --- against anything, and a `table<float>` is taken as a vector.
+  ---
+  --- An `integer` is refused rather than promoted — Saule never converts
+  --- numeric flavours on its own, and the library does not get a private
+  --- exemption.
+  static fn coerce(other: any) -> NDArray
+    local array: NDArray? = other as NDArray
+
+    if array != nil then
+      return array!
+    end
+
+    local k: float? = other as float
+
+    if k != nil then
+      return NDArray({k!}, {1})
+    end
+
+    local values: table<float>? = other as table<float>
+
+    if values != nil then
+      return NDArray.of(values!)
+    end
+
+    local whole: integer? = other as integer
+
+    if whole != nil then
+      throw "numsol: " .. whole! .. " is an integer and arrays hold floats — write "
+        .. whole! .. "f or " .. whole! .. ".0"
+    end
+
+    throw "numsol: cannot use a " .. type(other) .. " as an array operand"
+  end
+
+  -- ---------------------------------------------------------------- shape
+
+  --- The underlying buffer. Live, not a copy — `copy().getData()` when you
+  --- need one you may write to.
+  fn getData() -> table<float>
+    return self.data
+  end
+
+  --- The shape, as a fresh table: mutating the result cannot corrupt the
+  --- array.
+  fn getShape() -> table<integer>
+    return Table.copy(self.dims)
+  end
+
+  --- Number of axes. 1 for a vector, 2 for a matrix.
+  fn rank() -> integer
+    return #self.dims
+  end
+
+  --- Total element count.
+  fn size() -> integer
+    return #self.data
+  end
+
+  --- `#a` — the element count, same as `size()`.
+  fn len() -> integer
+    return #self.data
+  end
+
+  --- Extent along one axis. `a.dim(1)` is a matrix's row count.
+  fn dim(axis: integer) -> integer
+    Shape.requireAxis(self.dims, axis)
+
+    return self.dims[axis]
+  end
+
+  --- Row count of a matrix (extent of axis 1).
+  fn rowCount() -> integer
+    return self.dims[1]
+  end
+
+  --- Column count of a matrix. A vector reports 1 — it is a column of one.
+  fn colCount() -> integer
+    if #self.dims < 2 then
+      return 1
+    end
+
+    return self.dims[2]
+  end
+
+  --- Does this array have exactly this shape?
+  fn hasShape(other: table<integer>) -> boolean
+    return Shape.equal(self.dims, other)
+  end
+
+  --- Shape as text, e.g. `(2, 3)`.
+  fn shapeString() -> string
+    return Shape.text(self.dims)
+  end
+
+  -- ------------------------------------------------------------- elements
+
+  --- `a[i]` — flat element `i`, 1-based, ignoring shape.
+  fn index(key: integer) -> float
+    return self.data[key]
+  end
+
+  --- `a[i] = v` — write flat element `i`, in place.
+  fn newIndex(key: integer, value: float) -> nil
+    self.data[key] = value
+  end
+
+  --- Flat element `i`, the method form of `a[i]`.
+  fn at(i: integer) -> float
+    return self.data[i]
+  end
+
+  --- Write flat element `i`, the method form of `a[i] = v`.
+  fn setAt(i: integer, value: float) -> nil
+    self.data[i] = value
+  end
+
+  --- Element at a logical index — `a.get({2, 3})` is row 2, column 3.
+  fn get(idx: table<integer>) -> float
+    return self.data[Shape.offsetOf(self.dims, idx)]
+  end
+
+  --- Write the element at a logical index, in place.
+  fn set(idx: table<integer>, value: float) -> nil
+    self.data[Shape.offsetOf(self.dims, idx)] = value
+  end
+
+  --- The single element of a one-element array. Whole-array reductions
+  --- answer with a `float` directly; this is for the arrays that stay
+  --- arrays, like `a.sumAxis(1)` over a single column.
+  fn item() -> float
+    if #self.data != 1 then
+      throw "numsol: item() needs exactly one element, got " .. #self.data
+    end
+
+    return self.data[1]
+  end
+
+  --- An independent array with the same shape and contents.
+  fn copy() -> NDArray
+    return NDArray(Table.copy(self.data), Table.copy(self.dims))
+  end
+
+  -- ---------------------------------------------------------------- views
+
+  --- The same elements under a new shape. One dimension may be `-1`, which
+  --- is solved from the element count.
+  fn reshape(dims: table<integer>) -> NDArray
+    return NDArray(Table.copy(self.data), Shape.resolve(dims, #self.data))
+  end
+
+  --- A 1-D array of every element, row-major.
+  fn flatten() -> NDArray
+    return NDArray(Table.copy(self.data), {#self.data})
+  end
+
+  --- Axes reversed. For a matrix this is the ordinary transpose.
+  fn transpose() -> NDArray
+    return NDArray(Kernel.transposed(self.data, self.dims), Shape.reversed(self.dims))
+  end
+
+  --- Row `i` of a matrix, as a 1-D array of its columns.
+  fn row(i: integer) -> NDArray
+    self.requireMatrix("row")
+
+    local width: integer = self.dims[2]
+    local base: integer = (i - 1) * width
+    local out: table<float> = {}
+
+    for c: integer = 1, width do
+      out[c] = self.data[base + c]
+    end
+
+    return NDArray(out, {width})
+  end
+
+  --- Column `j` of a matrix, as a 1-D array of its rows.
+  fn col(j: integer) -> NDArray
+    self.requireMatrix("col")
+
+    local height: integer = self.dims[1]
+    local width: integer = self.dims[2]
+    local out: table<float> = {}
+
+    for r: integer = 1, height do
+      out[r] = self.data[(r - 1) * width + j]
+    end
+
+    return NDArray(out, {height})
+  end
+
+  --- Rows `first` through `last` inclusive, as a new matrix. This is how a
+  --- training loop cuts mini-batches.
+  fn slice(first: integer, last: integer) -> NDArray
+    self.requireMatrix("slice")
+
+    local width: integer = self.dims[2]
+    local height: integer = Math.max(last - first + 1, 0)
+    local out: table<float> = {}
+
+    for r: integer = first, last do
+      local base: integer = (r - 1) * width
+
+      for c: integer = 1, width do
+        out[#out + 1] = self.data[base + c]
+      end
+    end
+
+    return NDArray(out, {height, width})
+  end
+
+  --- This array stretched to `dims` by the broadcasting rules, materialised.
+  fn broadcastTo(dims: table<integer>) -> NDArray
+    if Shape.equal(self.dims, dims) then
+      return self.copy()
+    end
+
+    -- Checked for compatibility, then discarded: the result shape is `dims`.
+    Shape.broadcast(self.dims, dims)
+
+    return NDArray(Kernel.stretched(self.data, self.dims, dims), Table.copy(dims))
+  end
+
+  local fn requireMatrix(what: string) -> nil
+    if #self.dims != 2 then
+      throw "numsol: " .. what .. "() needs a rank-2 array, got " .. Shape.text(self.dims)
+    end
+  end
+
+  -- ------------------------------------------------------------- mapping
+
+  --- `f` applied to every element, into a new array of the same shape.
+  fn map(f: fn(float) -> float) -> NDArray
+    return NDArray(Kernel.mapped(self.data, f), Table.copy(self.dims))
+  end
+
+  --- `f` applied in place to every element. Returns `self`, so it chains.
+  fn mapInPlace(f: fn(float) -> float) -> NDArray
+    for i: integer = 1, #self.data do
+      self.data[i] = f(self.data[i])
+    end
+
+    return self
+  end
+
+  --- `f` applied pairwise with `other`, broadcasting the two shapes
+  --- together. Every arithmetic operator routes through here, and so can
+  --- an operation the library doesn't have:
+  ---
+  ---     local hinge: NDArray = scores.zip(labels, (s: float, y: float) =>
+  ---       Math.max(0.0, 1.0 - s * y))
+  fn zip(other: any, f: fn(float, float) -> float) -> NDArray
+    local rhs: NDArray = NDArray.coerce(other)
+    local rhsDims: table<integer> = rhs.getShape()
+    local outDims: table<integer> = self.dims
+
+    if not Shape.equal(self.dims, rhsDims) then
+      outDims = Shape.broadcast(self.dims, rhsDims)
+    end
+
+    return NDArray(
+      Kernel.zipped(self.data, self.dims, rhs.getData(), rhsDims, outDims, f),
+      Table.copy(outDims)
+    )
+  end
+
+  -- ---------------------------------------------------------- arithmetic
+
+  --- `a + b`, elementwise with broadcasting.
+  fn add(other: any) -> NDArray
+    return self.zip(other, (x: float, y: float) => x + y)
+  end
+
+  --- `a - b`, elementwise with broadcasting.
+  fn sub(other: any) -> NDArray
+    return self.zip(other, (x: float, y: float) => x - y)
+  end
+
+  --- `a * b` — elementwise, *not* a matrix product. That is `matmul`.
+  fn mul(other: any) -> NDArray
+    return self.zip(other, (x: float, y: float) => x * y)
+  end
+
+  --- `a / b`, elementwise with broadcasting.
+  fn div(other: any) -> NDArray
+    return self.zip(other, (x: float, y: float) => x / y)
+  end
+
+  --- `a % b`, elementwise with broadcasting.
+  fn mod(other: any) -> NDArray
+    return self.zip(other, (x: float, y: float) => x % y)
+  end
+
+  --- `a ^ b`, elementwise with broadcasting. `a ^ 2.0` squares every
+  --- element.
+  fn pow(other: any) -> NDArray
+    return self.zip(other, (x: float, y: float) => x ^ y)
+  end
+
+  --- `-a`.
+  fn neg() -> NDArray
+    return self.map((x: float) => -x)
+  end
+
+  -- -------------------------------------------------------------- in place
+
+  --- Add `other` into this array in place, broadcasting it up. Returns
+  --- `self`. The operators all allocate a result; this is the spelling for
+  --- an accumulator, and it is what an optimiser's inner loop uses.
+  fn addInPlace(other: any) -> NDArray
+    local rhs: NDArray = NDArray.coerce(other)
+
+    if not rhs.hasShape(self.dims) then
+      rhs = rhs.broadcastTo(self.dims)
+    end
+
+    local values: table<float> = rhs.getData()
+
+    for i: integer = 1, #self.data do
+      self.data[i] = self.data[i] + values[i]
+    end
+
+    return self
+  end
+
+  --- Multiply every element by `k` in place. Returns `self`.
+  fn scaleInPlace(k: float) -> NDArray
+    for i: integer = 1, #self.data do
+      self.data[i] = self.data[i] * k
+    end
+
+    return self
+  end
+
+  --- Set every element to `value`. Returns `self`.
+  fn fill(value: float) -> NDArray
+    for i: integer = 1, #self.data do
+      self.data[i] = value
+    end
+
+    return self
+  end
+
+  -- -------------------------------------------------------------- unary
+
+  --- `e^x` elementwise.
+  fn exp() -> NDArray
+    return self.map((x: float) => Math.exp(x))
+  end
+
+  --- Natural log elementwise.
+  fn log() -> NDArray
+    return self.map((x: float) => Math.log(x))
+  end
+
+  --- Square root elementwise.
+  fn sqrt() -> NDArray
+    return self.map((x: float) => Math.sqrt(x))
+  end
+
+  --- Magnitude elementwise.
+  fn abs() -> NDArray
+    return self.map(Scalar.abs)
+  end
+
+  --- Hyperbolic tangent elementwise.
+  fn tanh() -> NDArray
+    return self.map(Scalar.tanh)
+  end
+
+  --- Logistic sigmoid elementwise.
+  fn sigmoid() -> NDArray
+    return self.map(Scalar.sigmoid)
+  end
+
+  --- `sign(x)` elementwise, as a float.
+  fn sign() -> NDArray
+    return self.map(Scalar.sign)
+  end
+
+  --- The step function elementwise: 1 above zero, 0 at or below. ReLU's
+  --- derivative.
+  fn step() -> NDArray
+    return self.map(Scalar.step)
+  end
+
+  --- Elementwise `max(x, k)`. ReLU is `maximum(0.0)`.
+  fn maximum(k: float) -> NDArray
+    return self.map(fn(x: float) -> float
+      return Math.max(x, k)
+    end)
+  end
+
+  --- Elementwise `min(x, k)`.
+  fn minimum(k: float) -> NDArray
+    return self.map(fn(x: float) -> float
+      return Math.min(x, k)
+    end)
+  end
+
+  --- Every element pinned into `[lo, hi]`.
+  fn clamp(lo: float, hi: float) -> NDArray
+    return self.map(fn(x: float) -> float
+      return Math.clamp(x, lo, hi)
+    end)
+  end
+
+  -- ---------------------------------------------------------- reductions
+
+  --- Sum of every element.
+  fn sum() -> float
+    local total: float = 0.0
+
+    for i: integer = 1, #self.data do
+      total = total + self.data[i]
+    end
+
+    return total
+  end
+
+  --- Arithmetic mean of every element.
+  fn mean() -> float
+    local count: integer = #self.data
+
+    if count == 0 then
+      return 0.0
+    end
+
+    return self.sum() / (count as float)
+  end
+
+  --- Largest element.
+  fn maxValue() -> float
+    local best: float = self.data[1]
+
+    for i: integer = 2, #self.data do
+      if self.data[i] > best then
+        best = self.data[i]
+      end
+    end
+
+    return best
+  end
+
+  --- Smallest element.
+  fn minValue() -> float
+    local best: float = self.data[1]
+
+    for i: integer = 2, #self.data do
+      if self.data[i] < best then
+        best = self.data[i]
+      end
+    end
+
+    return best
+  end
+
+  --- Flat 1-based index of the largest element — the first one, on a tie.
+  fn argmax() -> integer
+    local best: integer = 1
+
+    for i: integer = 2, #self.data do
+      if self.data[i] > self.data[best] then
+        best = i
+      end
+    end
+
+    return best
+  end
+
+  --- Flat 1-based index of the smallest element.
+  fn argmin() -> integer
+    local best: integer = 1
+
+    for i: integer = 2, #self.data do
+      if self.data[i] < self.data[best] then
+        best = i
+      end
+    end
+
+    return best
+  end
+
+  --- Euclidean norm of every element.
+  fn norm() -> float
+    local total: float = 0.0
+
+    for i: integer = 1, #self.data do
+      total = total + self.data[i] * self.data[i]
+    end
+
+    return Math.sqrt(total)
+  end
+
+  --- Sum along one axis. With `keepDims` the axis survives at extent 1,
+  --- which is what keeps the result broadcastable against the input — a
+  --- bias gradient wants `sumAxis(1, true)` to stay a `(1, n)` row.
+  fn sumAxis(axis: integer, keepDims: boolean = false) -> NDArray
+    Shape.requireAxis(self.dims, axis)
+
+    return NDArray(
+      Kernel.reduced(self.data, self.dims, axis, false),
+      Shape.withoutAxis(self.dims, axis, keepDims)
+    )
+  end
+
+  --- Mean along one axis, same shape rules as `sumAxis`.
+  fn meanAxis(axis: integer, keepDims: boolean = false) -> NDArray
+    Shape.requireAxis(self.dims, axis)
+
+    return NDArray(
+      Kernel.reduced(self.data, self.dims, axis, true),
+      Shape.withoutAxis(self.dims, axis, keepDims)
+    )
+  end
+
+  --- Largest element along one axis. A stable softmax wants
+  --- `maxAxis(2, true)` so the maxima stay broadcastable.
+  fn maxAxis(axis: integer, keepDims: boolean = false) -> NDArray
+    Shape.requireAxis(self.dims, axis)
+
+    return NDArray(
+      Kernel.maxima(self.data, self.dims, axis),
+      Shape.withoutAxis(self.dims, axis, keepDims)
+    )
+  end
+
+  --- 1-based position of the largest element along one axis, as floats so
+  --- the result is still an array. The axis is dropped.
+  fn argmaxAxis(axis: integer) -> NDArray
+    Shape.requireAxis(self.dims, axis)
+
+    return NDArray(
+      Kernel.argmaxima(self.data, self.dims, axis),
+      Shape.withoutAxis(self.dims, axis, false)
+    )
+  end
+
+  -- ------------------------------------------------------- linear algebra
+
+  --- Matrix product. Both operands may be rank 1 or rank 2: a rank-1 left
+  --- operand is read as a row, a rank-1 right operand as a column, and the
+  --- promoted axis is dropped from the result — the convention numpy's `@`
+  --- follows.
+  fn matmul(other: any) -> NDArray
+    local rhs: NDArray = NDArray.coerce(other)
+    local leftDims: table<integer> = self.dims
+    local rightDims: table<integer> = rhs.getShape()
+
+    if #leftDims > 2 or #rightDims > 2 then
+      throw "numsol: matmul is rank-2 only, got " .. Shape.text(leftDims)
+        .. " and " .. Shape.text(rightDims)
+    end
+
+    local rowsDropped: boolean = #leftDims == 1
+    local colsDropped: boolean = #rightDims == 1
+
+    local height: integer = 1
+    local shared: integer = leftDims[1]
+
+    if not rowsDropped then
+      height = leftDims[1]
+      shared = leftDims[2]
+    end
+
+    local width: integer = 1
+
+    if not colsDropped then
+      width = rightDims[2]
+    end
+
+    if shared != rightDims[1] then
+      throw "numsol: cannot matmul " .. Shape.text(leftDims) .. " with "
+        .. Shape.text(rightDims) .. " — inner dimensions " .. shared
+        .. " and " .. rightDims[1] .. " differ"
+    end
+
+    local out: table<float> = Kernel.multiplied(self.data, height, shared,
+      rhs.getData(), width)
+
+    local outDims: table<integer> = {height, width}
+
+    if rowsDropped and colsDropped then
+      outDims = {1}
+    elseif rowsDropped then
+      outDims = {width}
+    elseif colsDropped then
+      outDims = {height}
+    end
+
+    return NDArray(out, outDims)
+  end
+
+  --- Inner product of two arrays with the same element count.
+  fn dot(other: any) -> float
+    local rhs: table<float> = NDArray.coerce(other).getData()
+
+    if #self.data != #rhs then
+      throw "numsol: dot needs matching element counts, got " .. #self.data
+        .. " and " .. #rhs
+    end
+
+    local total: float = 0.0
+
+    for i: integer = 1, #self.data do
+      total = total + self.data[i] * rhs[i]
+    end
+
+    return total
+  end
+
+  -- -------------------------------------------------------- comparison
+
+  --- `a == b` — same shape and every element identical. Floats being
+  --- floats, `allClose` is usually the honest question.
+  fn equals(other: NDArray) -> boolean
+    return self.allClose(other, 0.0)
+  end
+
+  --- Same shape, and no element differing by more than `tol`.
+  fn allClose(other: NDArray, tol: float = 0.000000001) -> boolean
+    if not Shape.equal(self.dims, other.getShape()) then
+      return false
+    end
+
+    local values: table<float> = other.getData()
+
+    for i: integer = 1, #self.data do
+      if Math.abs(self.data[i] - values[i]) > tol then
+        return false
+      end
+    end
+
+    return true
+  end
+
+  -- ---------------------------------------------------------- rendering
+
+  fn toString() -> string
+    return Format.render(self.data, self.dims)
+  end
+end

@@ -1,0 +1,361 @@
+--- num.sau — the numpy-shaped front door.
+---
+--- `Num` is where arrays are *made*. Once you have one, the operators and
+--- the methods on [NDArray] do the work:
+---
+---     local a: NDArray = Num.arange(0.0, 6.0).reshape({2, 3})
+---     local b: NDArray = Num.ones({2, 3})
+---
+---     println(a * 2.0 + b)
+---
+--- The function forms further down — `Num.exp(a)`, `Num.matmul(a, b)` —
+--- forward to the methods of the same name. They exist because some code
+--- reads better as `Num.matmul(w, x)` and some as `w.matmul(x)`, and there
+--- is no reason to pick one for everybody.
+
+import * from shape
+import * from kernel
+import * from ndarray
+import Scalar from scalar
+
+export class Num
+  -- ---------------------------------------------------------- construction
+
+  --- A 1-D array from a float table: `Num.array({1.0, 2.0, 3.0})`. The
+  --- same thing a bare `{1.0, 2.0, 3.0}` does in an `NDArray` slot.
+  static fn array(values: table<float>) -> NDArray
+    return NDArray.of(values)
+  end
+
+  --- A 2-D array from rows: `Num.matrix({{1.0, 2.0}, {3.0, 4.0}})`. Every
+  --- row must be the same length.
+  static fn matrix(rows: table<table<float>>) -> NDArray
+    local height: integer = #rows
+
+    if height == 0 then
+      return NDArray({}, {0, 0})
+    end
+
+    local width: integer = #rows[1]
+    local data: table<float> = {}
+
+    for r: integer = 1, height do
+      local row: table<float> = rows[r]
+
+      if #row != width then
+        throw "numsol: row " .. r .. " has " .. #row .. " elements, expected " .. width
+      end
+
+      for c: integer = 1, width do
+        data[#data + 1] = row[c]
+      end
+    end
+
+    return NDArray(data, {height, width})
+  end
+
+  --- A flat buffer reinterpreted under a shape. The buffer is taken, not
+  --- copied.
+  static fn shaped(data: table<float>, dims: table<integer>) -> NDArray
+    return NDArray(data, dims)
+  end
+
+  --- A one-element array, which broadcasts against anything. Writing
+  --- `a * 2.0` is usually shorter and does the same thing.
+  static fn scalar(value: float) -> NDArray
+    return NDArray({value}, {1})
+  end
+
+  --- All zeros.
+  static fn zeros(dims: table<integer>) -> NDArray
+    return NDArray.zeros(dims)
+  end
+
+  --- All ones.
+  static fn ones(dims: table<integer>) -> NDArray
+    return Num.full(dims, 1.0)
+  end
+
+  --- Every element `value`.
+  static fn full(dims: table<integer>, value: float) -> NDArray
+    return NDArray(Kernel.filled(Shape.sizeOf(dims), value), Table.copy(dims))
+  end
+
+  --- Zeros in the shape of an existing array.
+  static fn zerosLike(other: NDArray) -> NDArray
+    return NDArray.zeros(other.getShape())
+  end
+
+  --- Ones in the shape of an existing array.
+  static fn onesLike(other: NDArray) -> NDArray
+    return Num.full(other.getShape(), 1.0)
+  end
+
+  --- The `n` by `n` identity matrix.
+  static fn eye(n: integer) -> NDArray
+    local out: NDArray = NDArray.zeros({n, n})
+
+    for i: integer = 1, n do
+      out.setAt((i - 1) * n + i, 1.0)
+    end
+
+    return out
+  end
+
+  --- Half-open range `[start, stop)` in steps of `step`.
+  static fn arange(start: float, stop: float, step: float = 1.0) -> NDArray
+    if step == 0.0 then
+      throw "numsol: arange step must not be zero"
+    end
+
+    local data: table<float> = {}
+    local x: float = start
+
+    while (step > 0.0 and x < stop) or (step < 0.0 and x > stop) do
+      data[#data + 1] = x
+      x = x + step
+    end
+
+    return NDArray(data, {#data})
+  end
+
+  --- `count` points evenly spaced over the closed interval `[start, stop]`.
+  static fn linspace(start: float, stop: float, count: integer) -> NDArray
+    if count < 1 then
+      throw "numsol: linspace needs at least one point"
+    end
+
+    if count == 1 then
+      return NDArray({start}, {1})
+    end
+
+    local data: table<float> = {}
+    local step: float = (stop - start) / ((count - 1) as float)
+
+    for i: integer = 1, count do
+      data[i] = start + ((i - 1) as float) * step
+    end
+
+    return NDArray(data, {count})
+  end
+
+  --- Uniform noise over `[0, 1)`.
+  static fn random(dims: table<integer>) -> NDArray
+    local total: integer = Shape.sizeOf(dims)
+    local data: table<float> = {}
+
+    for i: integer = 1, total do
+      data[i] = Math.random()
+    end
+
+    return NDArray(data, Table.copy(dims))
+  end
+
+  --- Uniform noise over `[lo, hi)`.
+  static fn uniform(dims: table<integer>, lo: float, hi: float) -> NDArray
+    local total: integer = Shape.sizeOf(dims)
+    local data: table<float> = {}
+    local span: float = hi - lo
+
+    for i: integer = 1, total do
+      data[i] = lo + Math.random() * span
+    end
+
+    return NDArray(data, Table.copy(dims))
+  end
+
+  --- Standard normal noise, by the Box–Muller transform: each pair of
+  --- uniforms becomes a radius and an angle, and their components are two
+  --- independent normals.
+  static fn randn(dims: table<integer>) -> NDArray
+    local total: integer = Shape.sizeOf(dims)
+    local data: table<float> = {}
+    local i: integer = 1
+
+    while i <= total do
+      -- `Math.random()` can return exactly 0 and `log(0)` is -inf; nudge
+      -- it off the boundary. 1e-12, written out — no exponent literals.
+      local u1: float = Math.max(Math.random(), 0.000000000001)
+      local u2: float = Math.random()
+      local radius: float = Math.sqrt(-2.0 * Math.log(u1))
+      local angle: float = 2.0 * Math.pi * u2
+
+      data[i] = radius * Math.cos(angle)
+
+      if i + 1 <= total then
+        data[i + 1] = radius * Math.sin(angle)
+      end
+
+      i = i + 2
+    end
+
+    return NDArray(data, Table.copy(dims))
+  end
+
+  --- Rows stacked into one taller array. Every input must agree on every
+  --- axis but the first; rank-1 inputs become rows of a matrix.
+  static fn vstack(parts: table<NDArray>) -> NDArray
+    if #parts == 0 then
+      throw "numsol: vstack needs at least one array"
+    end
+
+    local width: integer = Num.rowWidth(parts[1])
+    local data: table<float> = {}
+    local height: integer = 0
+
+    for part: NDArray in parts do
+      local partWidth: integer = Num.rowWidth(part)
+
+      if partWidth != width then
+        throw "numsol: vstack rows disagree — " .. width .. " against " .. partWidth
+      end
+
+      local source: table<float> = part.getData()
+
+      for i: integer = 1, #source do
+        data[#data + 1] = source[i]
+      end
+
+      if part.rank() == 1 then
+        height = height + 1
+      else
+        height = height + part.dim(1)
+      end
+    end
+
+    return NDArray(data, {height, width})
+  end
+
+  --- Elements per row when an array is read as a stack of rows.
+  static local fn rowWidth(a: NDArray) -> integer
+    local dims: table<integer> = a.getShape()
+
+    if #dims == 1 then
+      return dims[1]
+    end
+
+    local width: integer = 1
+
+    for k: integer = 2, #dims do
+      width = width * dims[k]
+    end
+
+    return width
+  end
+
+  -- ------------------------------------------------------------ elementwise
+
+  --- `e^x` elementwise.
+  static fn exp(a: NDArray) -> NDArray
+    return a.exp()
+  end
+
+  --- Natural log elementwise.
+  static fn log(a: NDArray) -> NDArray
+    return a.log()
+  end
+
+  --- Square root elementwise.
+  static fn sqrt(a: NDArray) -> NDArray
+    return a.sqrt()
+  end
+
+  --- Magnitude elementwise.
+  static fn abs(a: NDArray) -> NDArray
+    return a.abs()
+  end
+
+  --- Hyperbolic tangent elementwise.
+  static fn tanh(a: NDArray) -> NDArray
+    return a.tanh()
+  end
+
+  --- Logistic sigmoid elementwise.
+  static fn sigmoid(a: NDArray) -> NDArray
+    return a.sigmoid()
+  end
+
+  --- Elementwise `max(x, k)` — ReLU is `Num.maximum(a, 0.0)`.
+  static fn maximum(a: NDArray, k: float) -> NDArray
+    return a.maximum(k)
+  end
+
+  --- Elementwise `min(x, k)`.
+  static fn minimum(a: NDArray, k: float) -> NDArray
+    return a.minimum(k)
+  end
+
+  --- Every element pinned into `[lo, hi]`.
+  static fn clamp(a: NDArray, lo: float, hi: float) -> NDArray
+    return a.clamp(lo, hi)
+  end
+
+  -- ------------------------------------------------------------- reductions
+
+  --- Sum of every element.
+  static fn sum(a: NDArray) -> float
+    return a.sum()
+  end
+
+  --- Mean of every element.
+  static fn mean(a: NDArray) -> float
+    return a.mean()
+  end
+
+  --- Largest element.
+  static fn max(a: NDArray) -> float
+    return a.maxValue()
+  end
+
+  --- Smallest element.
+  static fn min(a: NDArray) -> float
+    return a.minValue()
+  end
+
+  --- Flat 1-based index of the largest element.
+  static fn argmax(a: NDArray) -> integer
+    return a.argmax()
+  end
+
+  --- Euclidean norm of every element.
+  static fn norm(a: NDArray) -> float
+    return a.norm()
+  end
+
+  --- Sum along one axis; `keepDims` holds the axis open at extent 1.
+  static fn sumAxis(a: NDArray, axis: integer, keepDims: boolean = false) -> NDArray
+    return a.sumAxis(axis, keepDims)
+  end
+
+  --- Mean along one axis.
+  static fn meanAxis(a: NDArray, axis: integer, keepDims: boolean = false) -> NDArray
+    return a.meanAxis(axis, keepDims)
+  end
+
+  --- Largest element along one axis.
+  static fn maxAxis(a: NDArray, axis: integer, keepDims: boolean = false) -> NDArray
+    return a.maxAxis(axis, keepDims)
+  end
+
+  --- 1-based index of the largest element along one axis, as floats.
+  static fn argmaxAxis(a: NDArray, axis: integer) -> NDArray
+    return a.argmaxAxis(axis)
+  end
+
+  -- --------------------------------------------------------- linear algebra
+
+  --- Matrix product — numpy's `@`.
+  static fn matmul(a: NDArray, b: any) -> NDArray
+    return a.matmul(b)
+  end
+
+  --- Inner product of two equally sized arrays.
+  static fn dot(a: NDArray, b: any) -> float
+    return a.dot(b)
+  end
+
+  --- Axes reversed; the ordinary transpose for a matrix.
+  static fn transpose(a: NDArray) -> NDArray
+    return a.transpose()
+  end
+end

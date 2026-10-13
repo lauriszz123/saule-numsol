@@ -1,0 +1,36 @@
+--[[
+numsol — the array layer for Saule.
+
+    import * from "numsol"
+
+    local a: NDArray = Num.arange(0.0, 6.0).reshape({2, 3})
+    local b: NDArray = Num.ones({2, 3})
+
+    println(a * 2.0 + b)        -- the language's own operators
+    println(a.matmul(b.transpose()))
+
+What the barrel brings in, innermost first:
+
+  Shape     index arithmetic over `table<integer>` — sizes, broadcasting,
+            flat offsets. No arrays involved.
+  Cursor    an odometer over a shape, for walking one element at a time.
+  Scalar    float-level maths `Math` is missing: tanh, sigmoid, step.
+  Kernel    the loops, over flat `table<float>` buffers. Nothing here
+            knows what an NDArray is, so a native backend would replace
+            this file and nothing else.
+  Format    how an array renders.
+  NDArray   the array type: operators, views, reductions, matmul.
+  Num       where arrays are made — zeros, arange, randn, matrix — plus
+            function forms of the methods.
+
+Most programs need only the last two. The rest are exported because they
+are useful on their own and because a library that hides its own
+primitives is a library you cannot extend.
+]]
+
+import * from shape
+import * from scalar
+import * from kernel
+import * from format
+import * from ndarray
+import * from num

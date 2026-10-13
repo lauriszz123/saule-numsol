@@ -1,0 +1,52 @@
+--- format.sau — how an array prints.
+---
+--- Split out because rendering is pure presentation: it reads a buffer and
+--- a shape and returns a string, and it is the one part of the library you
+--- might reasonably want to change without touching any maths.
+
+import * from shape
+
+export class Format
+  --- How many elements of a high-rank array to show before giving up.
+  static local preview: integer = 8
+
+  --- A vector on one line, a matrix one row per line, and anything
+  --- higher-rank as its shape plus the first few elements.
+  static fn render(data: table<float>, dims: table<integer>) -> string
+    if #dims <= 1 then
+      return "[" .. Format.run(data, 1, #data) .. "]"
+    end
+
+    if #dims == 2 then
+      local width: integer = dims[2]
+      local lines: table<string> = {}
+
+      for r: integer = 1, dims[1] do
+        lines[#lines + 1] = " [" .. Format.run(data, (r - 1) * width + 1, width) .. "]"
+      end
+
+      return "[\n" .. String.join("\n", lines) .. "\n]"
+    end
+
+    local shown: integer = Math.min(#data, Format.preview)
+    local tail: string = ""
+
+    if shown < #data then
+      tail = ", ..."
+    end
+
+    return "NDArray" .. Shape.text(dims) .. " ["
+      .. Format.run(data, 1, shown) .. tail .. "]"
+  end
+
+  --- `count` elements from `start`, comma separated, four decimals each.
+  static local fn run(data: table<float>, start: integer, count: integer) -> string
+    local parts: table<string> = {}
+
+    for i: integer = start, start + count - 1 do
+      parts[#parts + 1] = String.format("%.4f", data[i])
+    end
+
+    return String.join(", ", parts)
+  end
+end

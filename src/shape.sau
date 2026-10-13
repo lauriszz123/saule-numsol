@@ -1,0 +1,272 @@
+--- shape.sau — the index arithmetic, with no arrays in sight.
+---
+--- Everything here is pure `table<integer>` maths: how many elements a
+--- shape holds, which shapes broadcast together, and where a logical index
+--- lands in a flat row-major buffer. Keeping it separate from `NDArray`
+--- means the fiddly part — the part that is all off-by-ones — can be read
+--- and tested on its own.
+---
+--- Shapes are `table<integer>`, outermost axis first. Logical indices are
+--- **1-based**, like every other index in Saule.
+
+export class Shape
+  --- Elements a shape holds. The empty shape is a scalar: 1.
+  static fn sizeOf(dims: table<integer>) -> integer
+    local total: integer = 1
+
+    for d: integer in dims do
+      total = total * d
+    end
+
+    return total
+  end
+
+  --- `(2, 3)` — how a shape reads in an error message.
+  static fn text(dims: table<integer>) -> string
+    local parts: table<string> = {}
+
+    for d: integer in dims do
+      parts[#parts + 1] = tostring(d)
+    end
+
+    return "(" .. String.join(", ", parts) .. ")"
+  end
+
+  --- Are two shapes identical?
+  static fn equal(a: table<integer>, b: table<integer>) -> boolean
+    if #a != #b then
+      return false
+    end
+
+    for k: integer = 1, #a do
+      if a[k] != b[k] then
+        return false
+      end
+    end
+
+    return true
+  end
+
+  --- The shape two shapes broadcast to, or a throw explaining why they
+  --- don't. Axes line up from the **right**; each pair must be equal, or
+  --- one of them must be 1 and gets stretched.
+  static fn broadcast(a: table<integer>, b: table<integer>) -> table<integer>
+    local rankA: integer = #a
+    local rankB: integer = #b
+    local rank: integer = Math.max(rankA, rankB)
+    local out: table<integer> = {}
+
+    for k: integer = 1, rank do
+      local da: integer = 1
+      local db: integer = 1
+
+      if k > rank - rankA then
+        da = a[k - (rank - rankA)]
+      end
+
+      if k > rank - rankB then
+        db = b[k - (rank - rankB)]
+      end
+
+      if da != db and da != 1 and db != 1 then
+        throw "numsol: shapes " .. Shape.text(a) .. " and " .. Shape.text(b)
+          .. " do not broadcast"
+      end
+
+      out[k] = Math.max(da, db)
+    end
+
+    return out
+  end
+
+  --- Flat 1-based offset of a logical index, with bounds checking.
+  static fn offsetOf(dims: table<integer>, idx: table<integer>) -> integer
+    if #idx != #dims then
+      throw "numsol: index of rank " .. #idx .. " into shape " .. Shape.text(dims)
+    end
+
+    local offset: integer = 0
+    local stride: integer = 1
+
+    for k: integer = #dims, 1, -1 do
+      local i: integer = idx[k]
+
+      if i < 1 or i > dims[k] then
+        throw "numsol: index " .. i .. " out of range on axis " .. k
+          .. " of shape " .. Shape.text(dims)
+      end
+
+      offset = offset + (i - 1) * stride
+      stride = stride * dims[k]
+    end
+
+    return offset + 1
+  end
+
+  --- Flat offset of an index *into a smaller shape that is being
+  --- broadcast*: a source axis of extent 1 is reused for every position
+  --- along it, and a shorter shape aligns to the right of the output's.
+  --- This one function is the whole of broadcasting.
+  static fn broadcastOffsetOf(dims: table<integer>, outIdx: table<integer>) -> integer
+    local rank: integer = #dims
+    local outRank: integer = #outIdx
+    local offset: integer = 0
+    local stride: integer = 1
+
+    for k: integer = rank, 1, -1 do
+      local extent: integer = dims[k]
+      local i: integer = 1
+
+      if extent > 1 then
+        i = outIdx[outRank - (rank - k)]
+      end
+
+      offset = offset + (i - 1) * stride
+      stride = stride * extent
+    end
+
+    return offset + 1
+  end
+
+  --- A reshape target with its single `-1` solved from `count`.
+  static fn resolve(dims: table<integer>, count: integer) -> table<integer>
+    local out: table<integer> = Table.copy(dims)
+    local hole: integer = 0
+    local known: integer = 1
+
+    for k: integer = 1, #out do
+      if out[k] == -1 then
+        if hole != 0 then
+          throw "numsol: reshape takes at most one -1"
+        end
+
+        hole = k
+      else
+        known = known * out[k]
+      end
+    end
+
+    if hole != 0 then
+      if known == 0 or count % known != 0 then
+        throw "numsol: cannot reshape " .. count .. " elements to " .. Shape.text(dims)
+      end
+
+      out[hole] = count / known
+    end
+
+    if Shape.sizeOf(out) != count then
+      throw "numsol: cannot reshape " .. count .. " elements to " .. Shape.text(out)
+    end
+
+    return out
+  end
+
+  --- Axes reversed — the shape a transpose produces.
+  static fn reversed(dims: table<integer>) -> table<integer>
+    local out: table<integer> = {}
+
+    for k: integer = #dims, 1, -1 do
+      out[#out + 1] = dims[k]
+    end
+
+    return out
+  end
+
+  --- The shape left after collapsing one axis. With `keepDims` the axis
+  --- stays at extent 1, which is what keeps the result broadcastable
+  --- against the input.
+  static fn withoutAxis(dims: table<integer>, axis: integer,
+    keepDims: boolean = false) -> table<integer>
+
+    Shape.requireAxis(dims, axis)
+
+    local out: table<integer> = {}
+
+    for k: integer = 1, #dims do
+      if k == axis then
+        if keepDims then
+          out[#out + 1] = 1
+        end
+      else
+        out[#out + 1] = dims[k]
+      end
+    end
+
+    if #out == 0 then
+      return {1}
+    end
+
+    return out
+  end
+
+  --- Elements in one step along `axis` — the product of every axis after
+  --- it. A flat index decomposes as
+  --- `((outer - 1) * extent + (position - 1)) * inner + inner_offset`,
+  --- which is how every axis-wise reduction walks the buffer.
+  static fn innerOf(dims: table<integer>, axis: integer) -> integer
+    local inner: integer = 1
+
+    for k: integer = axis + 1, #dims do
+      inner = inner * dims[k]
+    end
+
+    return inner
+  end
+
+  --- Independent slices before `axis` — the product of every axis before it.
+  static fn outerOf(dims: table<integer>, axis: integer) -> integer
+    local outer: integer = 1
+
+    for k: integer = 1, axis - 1 do
+      outer = outer * dims[k]
+    end
+
+    return outer
+  end
+
+  --- Throw unless `axis` names an axis of `dims`.
+  static fn requireAxis(dims: table<integer>, axis: integer) -> nil
+    if axis < 1 or axis > #dims then
+      throw "numsol: axis " .. axis .. " out of range for shape " .. Shape.text(dims)
+    end
+  end
+end
+
+--- An odometer over a shape: `current()` is the logical index, `advance()`
+--- rolls to the next one in row-major order. It saves decoding a flat
+--- index back into an index on every element, which is what the general
+--- broadcast and transpose paths would otherwise do.
+export class Cursor
+  local dims: table<integer>
+  local idx: table<integer>
+
+  fn init(dims: table<integer>)
+    self.dims = dims
+    self.idx = {}
+
+    for k: integer = 1, #dims do
+      self.idx[k] = 1
+    end
+  end
+
+  --- The current logical index. Live, not a copy — read it, don't keep it.
+  fn current() -> table<integer>
+    return self.idx
+  end
+
+  --- Step to the next index, carrying from the innermost axis outwards.
+  fn advance() -> nil
+    local axis: integer = #self.dims
+
+    while axis >= 1 do
+      self.idx[axis] = self.idx[axis] + 1
+
+      if self.idx[axis] <= self.dims[axis] then
+        return
+      end
+
+      self.idx[axis] = 1
+      axis = axis - 1
+    end
+  end
+end

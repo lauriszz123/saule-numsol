@@ -1,0 +1,259 @@
+--- kernel.sau — the loops, over flat buffers.
+---
+--- Every function here takes `table<float>` plus shapes and returns a new
+--- `table<float>`. Nothing in this file knows what an `NDArray` is, which
+--- is what keeps the dependency one-way: `NDArray` is a typed façade over
+--- these kernels, and the kernels never reach back.
+---
+--- This is also where the performance lives. If numsol ever grows a native
+--- backend, it replaces this file and nothing else.
+
+import * from shape
+
+export class Kernel
+  --- `count` copies of `value`.
+  static fn filled(count: integer, value: float) -> table<float>
+    local out: table<float> = {}
+
+    for i: integer = 1, count do
+      out[i] = value
+    end
+
+    return out
+  end
+
+  --- `f` over every element.
+  static fn mapped(data: table<float>, f: fn(float) -> float) -> table<float>
+    local out: table<float> = {}
+
+    for i: integer = 1, #data do
+      out[i] = f(data[i])
+    end
+
+    return out
+  end
+
+  --- `f` pairwise over two buffers whose shapes broadcast to `outDims`.
+  ---
+  --- Three paths, in order of how often they run: identical shapes walk
+  --- both buffers straight through; a one-element side becomes a constant;
+  --- anything else walks the output with a `Cursor` and resolves each
+  --- side's offset through `Shape.broadcastOffsetOf`.
+  static fn zipped(a: table<float>, aDims: table<integer>, b: table<float>,
+    bDims: table<integer>, outDims: table<integer>,
+    f: fn(float, float) -> float) -> table<float>
+
+    local out: table<float> = {}
+
+    if Shape.equal(aDims, bDims) then
+      for i: integer = 1, #a do
+        out[i] = f(a[i], b[i])
+      end
+
+      return out
+    end
+
+    if #b == 1 then
+      local rhs: float = b[1]
+
+      for i: integer = 1, #a do
+        out[i] = f(a[i], rhs)
+      end
+
+      return out
+    end
+
+    if #a == 1 then
+      local lhs: float = a[1]
+
+      for i: integer = 1, #b do
+        out[i] = f(lhs, b[i])
+      end
+
+      return out
+    end
+
+    local total: integer = Shape.sizeOf(outDims)
+    local cursor: Cursor = Cursor(outDims)
+
+    for flat: integer = 1, total do
+      local idx: table<integer> = cursor.current()
+
+      out[flat] = f(a[Shape.broadcastOffsetOf(aDims, idx)],
+        b[Shape.broadcastOffsetOf(bDims, idx)])
+
+      cursor.advance()
+    end
+
+    return out
+  end
+
+  --- `data` stretched from `dims` up to `outDims`, materialised.
+  static fn stretched(data: table<float>, dims: table<integer>,
+    outDims: table<integer>) -> table<float>
+
+    local total: integer = Shape.sizeOf(outDims)
+    local out: table<float> = {}
+    local cursor: Cursor = Cursor(outDims)
+
+    for flat: integer = 1, total do
+      out[flat] = data[Shape.broadcastOffsetOf(dims, cursor.current())]
+      cursor.advance()
+    end
+
+    return out
+  end
+
+  --- Axes reversed. Rank 2 gets a direct double loop, because that is the
+  --- case a neural net runs on every backward pass.
+  static fn transposed(data: table<float>, dims: table<integer>) -> table<float>
+    local rank: integer = #dims
+
+    if rank < 2 then
+      return Table.copy(data)
+    end
+
+    local out: table<float> = {}
+
+    if rank == 2 then
+      local height: integer = dims[1]
+      local width: integer = dims[2]
+
+      for c: integer = 1, width do
+        for r: integer = 1, height do
+          out[#out + 1] = data[(r - 1) * width + c]
+        end
+      end
+
+      return out
+    end
+
+    local outDims: table<integer> = Shape.reversed(dims)
+    local cursor: Cursor = Cursor(dims)
+
+    for flat: integer = 1, #data do
+      local idx: table<integer> = cursor.current()
+      local reversed: table<integer> = {}
+
+      for k: integer = rank, 1, -1 do
+        reversed[#reversed + 1] = idx[k]
+      end
+
+      out[Shape.offsetOf(outDims, reversed)] = data[flat]
+      cursor.advance()
+    end
+
+    return out
+  end
+
+  --- `(height, shared) @ (shared, width)`, row-major throughout.
+  static fn multiplied(a: table<float>, height: integer, shared: integer,
+    b: table<float>, width: integer) -> table<float>
+
+    local out: table<float> = {}
+
+    for r: integer = 1, height do
+      local leftBase: integer = (r - 1) * shared
+      local outBase: integer = (r - 1) * width
+
+      for c: integer = 1, width do
+        local total: float = 0.0
+
+        for k: integer = 1, shared do
+          total = total + a[leftBase + k] * b[(k - 1) * width + c]
+        end
+
+        out[outBase + c] = total
+      end
+    end
+
+    return out
+  end
+
+  --- Sum along `axis`, or the mean of it when `average` is set.
+  static fn reduced(data: table<float>, dims: table<integer>, axis: integer,
+    average: boolean) -> table<float>
+
+    local extent: integer = dims[axis]
+    local inner: integer = Shape.innerOf(dims, axis)
+    local outer: integer = Shape.outerOf(dims, axis)
+    local out: table<float> = {}
+
+    for o: integer = 1, outer do
+      for i: integer = 1, inner do
+        local total: float = 0.0
+
+        for a: integer = 1, extent do
+          total = total + data[((o - 1) * extent + (a - 1)) * inner + i]
+        end
+
+        if average then
+          total = total / (extent as float)
+        end
+
+        out[(o - 1) * inner + i] = total
+      end
+    end
+
+    return out
+  end
+
+  --- Largest value along `axis`.
+  static fn maxima(data: table<float>, dims: table<integer>,
+    axis: integer) -> table<float>
+
+    local extent: integer = dims[axis]
+    local inner: integer = Shape.innerOf(dims, axis)
+    local outer: integer = Shape.outerOf(dims, axis)
+    local out: table<float> = {}
+
+    for o: integer = 1, outer do
+      for i: integer = 1, inner do
+        local best: float = data[((o - 1) * extent) * inner + i]
+
+        for a: integer = 2, extent do
+          local value: float = data[((o - 1) * extent + (a - 1)) * inner + i]
+
+          if value > best then
+            best = value
+          end
+        end
+
+        out[(o - 1) * inner + i] = best
+      end
+    end
+
+    return out
+  end
+
+  --- 1-based position of the largest value along `axis`, as a float so the
+  --- result is an ordinary array. First one wins a tie.
+  static fn argmaxima(data: table<float>, dims: table<integer>,
+    axis: integer) -> table<float>
+
+    local extent: integer = dims[axis]
+    local inner: integer = Shape.innerOf(dims, axis)
+    local outer: integer = Shape.outerOf(dims, axis)
+    local out: table<float> = {}
+
+    for o: integer = 1, outer do
+      for i: integer = 1, inner do
+        local best: integer = 1
+        local bestValue: float = data[((o - 1) * extent) * inner + i]
+
+        for a: integer = 2, extent do
+          local value: float = data[((o - 1) * extent + (a - 1)) * inner + i]
+
+          if value > bestValue then
+            bestValue = value
+            best = a
+          end
+        end
+
+        out[(o - 1) * inner + i] = best as float
+      end
+    end
+
+    return out
+  end
+end

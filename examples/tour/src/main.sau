@@ -1,0 +1,342 @@
+--- A tour of numsol that doubles as its smoke test.
+---
+--- Every claim below is asserted, so `saule run` either prints a clean
+--- report or stops on the first thing that broke.
+
+import * from "numsol"
+
+class Check
+  static local passed: integer = 0
+  static local failed: integer = 0
+
+  static fn ok(name: string, condition: boolean) -> nil
+    if condition then
+      Check.passed = Check.passed + 1
+      println("  ok   " .. name)
+    else
+      Check.failed = Check.failed + 1
+      println("  FAIL " .. name)
+    end
+  end
+
+  --- Compare an array's elements, row-major, against a flat list.
+  static fn close(name: string, a: NDArray, expected: table<float>) -> nil
+    Check.ok(name, a.flatten().allClose(Num.array(expected), 0.00001))
+  end
+
+  static fn report() -> integer
+    println("")
+    println(Check.passed .. " passed, " .. Check.failed .. " failed")
+
+    return Check.failed
+  end
+end
+
+class Main
+  static fn main()
+    Main.construction()
+    Main.shapes()
+    Main.operators()
+    Main.indexing()
+    Main.broadcasting()
+    Main.reductions()
+    Main.linearAlgebra()
+    Main.printing()
+
+    if Check.report() != 0 then
+      throw "numsol tour failed"
+    end
+  end
+
+  static fn construction()
+    println("-- construction --")
+
+    local z: NDArray = Num.zeros({2, 3})
+    Check.ok("zeros fills the shape", z.size() == 6 and z.sum() == 0.0)
+    Check.ok("zeros shape", z.hasShape({2, 3}))
+
+    Check.ok("ones sums to its size", Num.ones({4}).sum() == 4.0)
+    Check.close("full", Num.full({3}, 2.5), {2.5, 2.5, 2.5})
+    Check.close("eye", Num.eye(2), {1.0, 0.0, 0.0, 1.0})
+    Check.close("arange", Num.arange(0.0, 5.0), {0.0, 1.0, 2.0, 3.0, 4.0})
+    Check.close("arange with step", Num.arange(1.0, 2.0, 0.5), {1.0, 1.5})
+    Check.close("linspace", Num.linspace(0.0, 1.0, 3), {0.0, 0.5, 1.0})
+    Check.close("matrix", Num.matrix({{1.0, 2.0}, {3.0, 4.0}}), {1.0, 2.0, 3.0, 4.0})
+    Check.close("zerosLike", Num.zerosLike(z), {0.0, 0.0, 0.0, 0.0, 0.0, 0.0})
+
+    -- `Assignable` — a float table drops straight into an NDArray slot.
+    local v: NDArray = {1.0, 2.0, 3.0}
+    Check.close("a table literal becomes a vector", v, {1.0, 2.0, 3.0})
+
+    local noise: NDArray = Num.random({100})
+    Check.ok("random stays in [0, 1)", noise.minValue() >= 0.0 and noise.maxValue() < 1.0)
+
+    -- 1000 standard normals: the mean lands near zero.
+    Check.ok("randn is roughly centred", Math.abs(Num.randn({1000}).mean()) < 0.2)
+
+    Check.close("vstack", Num.vstack({Num.array({1.0, 2.0}), Num.array({3.0, 4.0})}),
+      {1.0, 2.0, 3.0, 4.0})
+    Check.ok("vstack shape",
+      Num.vstack({Num.array({1.0, 2.0}), Num.array({3.0, 4.0})}).hasShape({2, 2}))
+  end
+
+  static fn shapes()
+    println("")
+    println("-- shapes --")
+
+    local a: NDArray = Num.arange(0.0, 6.0).reshape({2, 3})
+    Check.ok("reshape keeps the elements", a.hasShape({2, 3}) and a.sum() == 15.0)
+    Check.ok("reshape solves a -1", a.reshape({3, -1}).hasShape({3, 2}))
+    Check.ok("rank", a.rank() == 2)
+    Check.ok("dim", a.dim(1) == 2 and a.dim(2) == 3)
+
+    Check.close("transpose", a.transpose(), {0.0, 3.0, 1.0, 4.0, 2.0, 5.0})
+    Check.ok("transpose shape", a.transpose().hasShape({3, 2}))
+    Check.ok("transpose twice is identity", a.transpose().transpose() == a)
+
+    Check.close("row", a.row(2), {3.0, 4.0, 5.0})
+    Check.close("col", a.col(1), {0.0, 3.0})
+    Check.close("slice", a.slice(2, 2), {3.0, 4.0, 5.0})
+    Check.close("flatten", a.flatten(), {0.0, 1.0, 2.0, 3.0, 4.0, 5.0})
+
+    -- Rank 3, to exercise the general transpose path rather than the
+    -- rank-2 shortcut.
+    local cube: NDArray = Num.arange(0.0, 8.0).reshape({2, 2, 2})
+    Check.ok("rank-3 transpose shape", cube.transpose().hasShape({2, 2, 2}))
+    Check.ok("rank-3 transpose twice is identity", cube.transpose().transpose() == cube)
+    Check.close("rank-3 transpose", cube.transpose(),
+      {0.0, 4.0, 2.0, 6.0, 1.0, 5.0, 3.0, 7.0})
+
+    local b: NDArray = a.copy()
+    b.set({1, 1}, 99.0)
+    Check.ok("copy is independent", a.get({1, 1}) == 0.0 and b.get({1, 1}) == 99.0)
+  end
+
+  --- The point of the library: arithmetic is the language's own.
+  static fn operators()
+    println("")
+    println("-- operators --")
+
+    local a: NDArray = {1.0, 2.0, 3.0}
+    local b: NDArray = {10.0, 20.0, 30.0}
+
+    Check.close("a + b", a + b, {11.0, 22.0, 33.0})
+    Check.close("b - a", b - a, {9.0, 18.0, 27.0})
+    Check.close("a * b", a * b, {10.0, 40.0, 90.0})
+    Check.close("b / a", b / a, {10.0, 10.0, 10.0})
+    Check.close("-a", -a, {-1.0, -2.0, -3.0})
+
+    -- A lone float on the right broadcasts over every element.
+    Check.close("a + 1.0", a + 1.0, {2.0, 3.0, 4.0})
+    Check.close("a - 1.0", a - 1.0, {0.0, 1.0, 2.0})
+    Check.close("a * 2.0", a * 2.0, {2.0, 4.0, 6.0})
+    Check.close("a / 2.0", a / 2.0, {0.5, 1.0, 1.5})
+    Check.close("a ^ 2.0", a ^ 2.0, {1.0, 4.0, 9.0})
+    Check.close("a % 2.0", a % 2.0, {1.0, 0.0, 1.0})
+
+    -- So does a plain float table.
+    Check.close("a + a table", a + {5.0, 5.0, 5.0}, {6.0, 7.0, 8.0})
+
+    -- Compound expressions stay readable, which is the whole point.
+    Check.close("2a + b/10 - 1", a * 2.0 + b / 10.0 - 1.0, {2.0, 5.0, 8.0})
+
+    Check.ok("#a is the element count", #a == 3)
+    Check.ok("a == a", a == Num.array({1.0, 2.0, 3.0}))
+    Check.ok("a != b", a != b)
+
+    Check.close("map", a.map((x: float) => x * x + 1.0), {2.0, 5.0, 10.0})
+    -- `Scalar.max` rather than `Math.max`: the generic `Math` helpers leak
+    -- their unresolved `N` out of an arrow lambda's inferred return type
+    -- on Saule 26.1, and `Scalar` is the float-typed way round it.
+    Check.close("zip", a.zip(b, (x: float, y: float) => Scalar.max(x, y) - x),
+      {9.0, 18.0, 27.0})
+
+    Check.close("exp(0) is 1", Num.zeros({2}).exp(), {1.0, 1.0})
+    Check.close("log(1) is 0", Num.ones({2}).log(), {0.0, 0.0})
+    Check.close("sqrt", Num.array({4.0, 9.0}).sqrt(), {2.0, 3.0})
+    Check.close("abs", Num.array({-1.0, 2.0}).abs(), {1.0, 2.0})
+    Check.close("tanh(0) is 0", Num.zeros({1}).tanh(), {0.0})
+    Check.ok("tanh saturates", Num.full({1}, 50.0).tanh().item() == 1.0)
+    Check.close("sigmoid(0) is 0.5", Num.zeros({1}).sigmoid(), {0.5})
+    Check.close("maximum is relu", Num.array({-2.0, 3.0}).maximum(0.0), {0.0, 3.0})
+    Check.close("step", Num.array({-2.0, 0.0, 3.0}).step(), {0.0, 0.0, 1.0})
+    Check.close("clamp", Num.array({-5.0, 0.5, 5.0}).clamp(0.0, 1.0), {0.0, 0.5, 1.0})
+
+    -- The in-place forms return self, so they chain and skip allocating.
+    local acc: NDArray = Num.zeros({3})
+    acc.addInPlace(a).addInPlace(b).scaleInPlace(0.5)
+    Check.close("in-place chain", acc, {5.5, 11.0, 16.5})
+
+    -- An integer is refused rather than quietly promoted, the same stance
+    -- the language itself takes on `1 + 2.5`.
+    local refused: boolean = false
+
+    try
+      local bad: NDArray = a + 2
+      println(bad.shapeString())
+    catch err: string
+      refused = true
+    end
+
+    Check.ok("an integer operand is refused", refused)
+  end
+
+  static fn indexing()
+    println("")
+    println("-- indexing --")
+
+    local a: NDArray = Num.arange(0.0, 6.0).reshape({2, 3})
+
+    -- `a[i]` is flat, row-major, 1-based.
+    Check.ok("a[1]", a[1] == 0.0)
+    Check.ok("a[6]", a[6] == 5.0)
+
+    -- `a.get({r, c})` is the logical index.
+    Check.ok("get is 1-based", a.get({1, 1}) == 0.0 and a.get({2, 3}) == 5.0)
+
+    a[1] = 100.0
+    Check.ok("a[i] = v writes in place", a[1] == 100.0)
+
+    a.set({2, 3}, 50.0)
+    Check.ok("set writes in place", a[6] == 50.0)
+
+    local caught: boolean = false
+
+    try
+      println(a.get({3, 1}))
+    catch err: string
+      caught = true
+    end
+
+    Check.ok("an out-of-range index throws", caught)
+  end
+
+  static fn broadcasting()
+    println("")
+    println("-- broadcasting --")
+
+    local m: NDArray = Num.matrix({{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}})
+    local bias: NDArray = Num.matrix({{10.0, 20.0, 30.0}})
+
+    -- (2, 3) against (1, 3): the single row is reused for both rows.
+    Check.close("row broadcast", m + bias, {11.0, 22.0, 33.0, 14.0, 25.0, 36.0})
+
+    -- (2, 3) against (3): a shorter shape aligns to the right.
+    Check.close("rank broadcast", m + Num.array({1.0, 1.0, 1.0}),
+      {2.0, 3.0, 4.0, 5.0, 6.0, 7.0})
+
+    -- (2, 3) against (2, 1): the single column is reused across columns.
+    Check.close("column broadcast", m + Num.matrix({{1.0}, {2.0}}),
+      {2.0, 3.0, 4.0, 6.0, 7.0, 8.0})
+
+    -- (2, 1) against (1, 3): both sides stretch, giving the outer sum.
+    Check.close("mutual broadcast",
+      Num.matrix({{1.0}, {2.0}}) + Num.matrix({{10.0, 20.0, 30.0}}),
+      {11.0, 21.0, 31.0, 12.0, 22.0, 32.0})
+
+    Check.ok("broadcastTo materialises", bias.broadcastTo({2, 3}).hasShape({2, 3}))
+    Check.ok("Shape.broadcast", Shape.broadcast({2, 1}, {3})[2] == 3)
+    Check.ok("Shape.sizeOf", Shape.sizeOf({2, 3, 4}) == 24)
+    Check.ok("Shape.text", Shape.text({2, 3}) == "(2, 3)")
+
+    local failed: boolean = false
+
+    try
+      local bad: NDArray = m + Num.zeros({4})
+      println(bad.shapeString())
+    catch err: string
+      failed = true
+    end
+
+    Check.ok("incompatible shapes throw", failed)
+  end
+
+  static fn reductions()
+    println("")
+    println("-- reductions --")
+
+    local m: NDArray = Num.matrix({{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}})
+
+    Check.ok("sum", m.sum() == 21.0)
+    Check.ok("mean", m.mean() == 3.5)
+    Check.ok("maxValue", m.maxValue() == 6.0)
+    Check.ok("minValue", m.minValue() == 1.0)
+    Check.ok("argmax is a flat index", m.argmax() == 6)
+    Check.ok("argmin is a flat index", m.argmin() == 1)
+    Check.ok("norm", Math.abs(Num.array({3.0, 4.0}).norm() - 5.0) < 0.00001)
+
+    -- Axis 1 collapses the rows, leaving one value per column.
+    Check.close("sumAxis(1)", m.sumAxis(1), {5.0, 7.0, 9.0})
+    Check.ok("sumAxis(1) drops the axis", m.sumAxis(1).hasShape({3}))
+    Check.ok("keepDims holds it open", m.sumAxis(1, true).hasShape({1, 3}))
+
+    -- Axis 2 collapses the columns, leaving one value per row.
+    Check.close("sumAxis(2)", m.sumAxis(2), {6.0, 15.0})
+    Check.close("meanAxis(1)", m.meanAxis(1), {2.5, 3.5, 4.5})
+    Check.close("meanAxis(2)", m.meanAxis(2), {2.0, 5.0})
+
+    local picks: NDArray = Num.matrix({{1.0, 9.0, 3.0}, {4.0, 5.0, 6.0}})
+    Check.close("maxAxis(1)", picks.maxAxis(1), {4.0, 9.0, 6.0})
+    Check.close("maxAxis(2)", picks.maxAxis(2), {9.0, 6.0})
+    Check.ok("maxAxis keepDims", picks.maxAxis(2, true).hasShape({2, 1}))
+    Check.close("argmaxAxis(2) picks per row", picks.argmaxAxis(2), {2.0, 3.0})
+    Check.close("argmaxAxis(1) picks per column", picks.argmaxAxis(1), {2.0, 1.0, 2.0})
+
+    -- A softmax, written with nothing but the operators.
+    local scores: NDArray = Num.matrix({{1.0, 2.0, 3.0}})
+    local raised: NDArray = (scores - scores.maxAxis(2, true)).exp()
+    local probabilities: NDArray = raised / raised.sumAxis(2, true)
+    Check.ok("a softmax sums to one", Math.abs(probabilities.sum() - 1.0) < 0.00001)
+  end
+
+  static fn linearAlgebra()
+    println("")
+    println("-- linear algebra --")
+
+    local a: NDArray = Num.matrix({{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}})
+    local b: NDArray = Num.matrix({{7.0, 8.0}, {9.0, 10.0}, {11.0, 12.0}})
+
+    local product: NDArray = a.matmul(b)
+    Check.ok("matmul shape", product.hasShape({2, 2}))
+    Check.close("matmul", product, {58.0, 64.0, 139.0, 154.0})
+
+    Check.ok("identity is identity", a.matmul(Num.eye(3)) == a)
+
+    -- A rank-1 right operand is a column, and its axis is dropped again.
+    Check.close("matrix times vector", a.matmul({1.0, 1.0, 1.0}), {6.0, 15.0})
+    Check.ok("matrix times vector shape", a.matmul({1.0, 1.0, 1.0}).hasShape({2}))
+
+    -- A rank-1 left operand is a row.
+    Check.close("vector times matrix", Num.array({1.0, 1.0}).matmul(a), {5.0, 7.0, 9.0})
+
+    Check.ok("dot", Num.array({1.0, 2.0, 3.0}).dot({4.0, 5.0, 6.0}) == 32.0)
+    Check.ok("Num.matmul", Num.matmul(a, b) == product)
+
+    local mismatched: boolean = false
+
+    try
+      local bad: NDArray = a.matmul(a)
+      println(bad.shapeString())
+    catch err: string
+      mismatched = true
+    end
+
+    Check.ok("mismatched inner dimensions throw", mismatched)
+  end
+
+  static fn printing()
+    println("")
+    println("-- printing --")
+
+    local v: NDArray = {1.0, 2.5}
+    local m: NDArray = Num.matrix({{1.0, 2.0}, {3.0, 4.0}})
+
+    println("  vector: " .. v)
+    println("  matrix: " .. m)
+    println("  cube:   " .. Num.ones({2, 2, 2}))
+    println("  shape:  " .. m.shapeString())
+
+    Check.ok("a vector renders on one line", tostring(v) == "[1.0000, 2.5000]")
+    Check.ok("shapeString", m.shapeString() == "(2, 2)")
+  end
+end

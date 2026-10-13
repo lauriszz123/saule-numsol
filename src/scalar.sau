@@ -1,0 +1,74 @@
+--- scalar.sau — float-level maths that `Math` does not carry, or that it
+--- carries in a form a lambda cannot use.
+---
+--- Two reasons this file exists:
+---
+--- 1. `Math` has no `tanh` or `sigmoid`, and both need their saturating
+---    branches written out to stay finite on large inputs.
+--- 2. `Math.abs`, `Math.max` and `Math.min` are generic over numeric
+---    flavour (`<N>`), and on Saule 26.1 that `N` leaks unresolved out of
+---    an arrow lambda's inferred return type — `(x: float) => Math.abs(x)`
+---    is rejected as `fn(float) -> N`. Wrapping each one in a function
+---    that *declares* `-> float` pins the flavour, and the wrapper can
+---    then be passed to `map` by name.
+
+export class Scalar
+  --- Magnitude.
+  static fn abs(x: float) -> float
+    return Math.abs(x)
+  end
+
+  --- The larger of two.
+  static fn max(a: float, b: float) -> float
+    return Math.max(a, b)
+  end
+
+  --- The smaller of two.
+  static fn min(a: float, b: float) -> float
+    return Math.min(a, b)
+  end
+
+  --- `-1.0`, `0.0` or `1.0`.
+  static fn sign(x: float) -> float
+    return Math.sign(x) as float
+  end
+
+  --- Hyperbolic tangent. Saturates past |20|, where the double-precision
+  --- answer is already exactly ±1 and `exp` is heading for overflow.
+  static fn tanh(x: float) -> float
+    if x > 20.0 then
+      return 1.0
+    end
+
+    if x < -20.0 then
+      return -1.0
+    end
+
+    local e: float = Math.exp(2.0 * x)
+
+    return (e - 1.0) / (e + 1.0)
+  end
+
+  --- Logistic sigmoid, `1 / (1 + e^-x)`, computed in whichever half keeps
+  --- the exponent negative so it cannot overflow.
+  static fn sigmoid(x: float) -> float
+    if x >= 0.0 then
+      return 1.0 / (1.0 + Math.exp(-x))
+    end
+
+    local e: float = Math.exp(x)
+
+    return e / (1.0 + e)
+  end
+
+  --- The step function: 1 above zero, 0 at or below it. This is ReLU's
+  --- derivative, with the kink at zero assigned a slope of 0 the way every
+  --- framework does.
+  static fn step(x: float) -> float
+    if x > 0.0 then
+      return 1.0
+    end
+
+    return 0.0
+  end
+end
