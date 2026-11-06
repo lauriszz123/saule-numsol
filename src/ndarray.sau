@@ -38,10 +38,10 @@
 --- float` (or the `f` suffix) at the call site — passing `2` where `2.0`
 --- belongs is reported rather than promoted.
 
-import * from shape
-import * from kernel
-import * from format
-import Scalar from scalar
+from shape import *
+from kernel import *
+from format import *
+from scalar import Scalar
 
 export class NDArray implements OpAdd<any, NDArray>, OpSub<any, NDArray>,
   OpMul<any, NDArray>, OpDiv<any, NDArray>, OpMod<any, NDArray>,

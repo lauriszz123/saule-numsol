@@ -13,10 +13,10 @@
 --- reads better as `Num.matmul(w, x)` and some as `w.matmul(x)`, and there
 --- is no reason to pick one for everybody.
 
-import * from shape
-import * from kernel
-import * from ndarray
-import Scalar from scalar
+from shape import *
+from kernel import *
+from ndarray import *
+from scalar import Scalar
 
 export class Num
   -- ---------------------------------------------------------- construction

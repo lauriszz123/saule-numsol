@@ -3,7 +3,7 @@
 --- Every claim below is asserted, so `saule run` either prints a clean
 --- report or stops on the first thing that broke.
 
-import * from "numsol"
+from "numsol" import *
 
 class Check
   static local passed: integer = 0

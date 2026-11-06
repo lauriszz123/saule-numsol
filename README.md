@@ -4,7 +4,7 @@ The array layer for [Saule](https://github.com/lauriszz123/saule) — numpy's
 shape, in Saule's types, using Saule's own operators.
 
 ```saule
-import * from "numsol"
+from "numsol" import *
 
 local a: NDArray = Num.arange(0.0, 6.0).reshape({2, 3})
 local b: NDArray = Num.ones({2, 3})
@@ -23,7 +23,7 @@ code, nothing to build.
 dependencies: ["../saule-numsol"]
 ```
 
-The package name is `numsol`, so `import * from "numsol"`.
+The package name is `numsol`, so `from "numsol" import *`.
 
 ## Operators
 

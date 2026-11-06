@@ -4,7 +4,7 @@
 --- a shape and returns a string, and it is the one part of the library you
 --- might reasonably want to change without touching any maths.
 
-import * from shape
+from shape import *
 
 export class Format
   --- How many elements of a high-rank array to show before giving up.

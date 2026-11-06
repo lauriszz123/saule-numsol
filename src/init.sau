@@ -1,7 +1,7 @@
 --[[
 numsol — the array layer for Saule.
 
-    import * from "numsol"
+    export from "numsol" import *
 
     local a: NDArray = Num.arange(0.0, 6.0).reshape({2, 3})
     local b: NDArray = Num.ones({2, 3})
@@ -28,9 +28,9 @@ are useful on their own and because a library that hides its own
 primitives is a library you cannot extend.
 ]]
 
-import * from shape
-import * from scalar
-import * from kernel
-import * from format
-import * from ndarray
-import * from num
+export from shape import *
+export from scalar import *
+export from kernel import *
+export from format import *
+export from ndarray import *
+export from num import *

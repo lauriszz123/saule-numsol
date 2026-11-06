@@ -8,7 +8,7 @@
 --- This is also where the performance lives. If numsol ever grows a native
 --- backend, it replaces this file and nothing else.
 
-import * from shape
+from shape import *
 
 export class Kernel
   --- `count` copies of `value`.
